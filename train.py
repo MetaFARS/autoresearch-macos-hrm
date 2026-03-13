@@ -524,8 +524,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 52       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 32           # target head dimension for attention
+ASPECT_RATIO = 51       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 8            # target head dimension for attention
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
