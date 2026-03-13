@@ -793,7 +793,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = 80       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
@@ -810,9 +810,9 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 4               # number of transformer layers
-DEVICE_BATCH_SIZE = 8   # per-device batch size (reduce if OOM)
-MODEL_IMPL = os.environ.get("MODEL_IMPL", "hrm").lower()  # "hrm" | "gpt"
+DEPTH = 8               # number of transformer layers
+DEVICE_BATCH_SIZE = 2   # per-device batch size (reduce if OOM)
+MODEL_IMPL = os.environ.get("MODEL_IMPL", "gpt").lower()  # "hrm" | "gpt"
 TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
 MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
 
