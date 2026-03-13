@@ -811,7 +811,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 4               # number of transformer layers
-DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 8   # per-device batch size (reduce if OOM)
 MODEL_IMPL = os.environ.get("MODEL_IMPL", "hrm").lower()  # "hrm" | "gpt"
 TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
 MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
