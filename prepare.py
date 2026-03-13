@@ -49,7 +49,9 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+DATASET_PATH = "datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+DEFAULT_ENDPOINT = "https://huggingface.co"
+BASE_URL = f"{DEFAULT_ENDPOINT}/{DATASET_PATH}"
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
 VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
@@ -65,6 +67,40 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
+def _env_str(name, default=None):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
+
+
+def _env_float(name, default):
+    value = _env_str(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _resolve_base_urls():
+    endpoint = _env_str("HF_ENDPOINT")
+    urls = []
+    if endpoint is not None:
+        urls.append(f"{endpoint.rstrip('/')}/{DATASET_PATH}")
+    if BASE_URL not in urls:
+        urls.append(BASE_URL)
+    return urls
+
+
+def _request_headers():
+    token = _env_str("HF_TOKEN") or _env_str("HUGGING_FACE_HUB_TOKEN")
+    if token is None:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
 def download_single_shard(index):
     """Download one parquet shard with retries. Returns True on success."""
     filename = f"shard_{index:05d}.parquet"
@@ -72,31 +108,37 @@ def download_single_shard(index):
     if os.path.exists(filepath):
         return True
 
-    url = f"{BASE_URL}/{filename}"
+    base_urls = _resolve_base_urls()
+    headers = _request_headers()
     max_attempts = 5
+    timeout = _env_float("HF_HUB_DOWNLOAD_TIMEOUT", 30.0)
+    timeout = timeout if timeout > 0 else 30.0
     for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
+        for base_url in base_urls:
+            url = f"{base_url}/{filename}"
+            try:
+                response = requests.get(url, stream=True, timeout=timeout, headers=headers)
+                response.raise_for_status()
+                temp_path = filepath + ".tmp"
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                os.rename(temp_path, filepath)
+                print(f"  Downloaded {filename} from {base_url}")
+                return True
+            except (requests.RequestException, IOError) as e:
+                print(f"  Attempt {attempt}/{max_attempts} failed for {filename} via {base_url}: {e}")
+                for path in [filepath + ".tmp", filepath]:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+        if attempt < max_attempts:
+            time.sleep(2 ** attempt)
     return False
+
 
 
 def download_data(num_shards, download_workers=8):
@@ -391,6 +433,7 @@ if __name__ == "__main__":
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"Data source candidates: {_resolve_base_urls()}")
     print()
 
     # Step 1: Download data

@@ -11,11 +11,13 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import time
 from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple
 
 import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 def verify_macos_env():
     if sys.platform != "darwin":
@@ -27,21 +29,52 @@ def verify_macos_env():
 
 verify_macos_env()
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
 
+
 @dataclass
-class GPTConfig:
+class HRMConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: int = 12
+
+    n_embd: int = 768
     n_head: int = 6
     n_kv_head: int = 6
-    n_embd: int = 768
+    n_layer: int = 12
     window_pattern: str = "SSSL"
+
+    hidden_size: int | None = None
+    intermediate_size: int | None = None
+    batch_size: int = 256
+    head_dim: int = 64
+    is_causal: bool = True
+
+    H_cycles: int = 2
+    L_cycles: int = 2
+
+    cycle_per_data: int = 16
+
+    norm_eps: float = 1e-6
+    rope_base: float = 10000.0
+    forward_dtype: str = "float32"  # change to float32 if your hardware doesn't support bfloat16
+
+    seed: int = 7
+
+    def __post_init__(self):
+        if self.hidden_size is None:
+            self.hidden_size = self.n_embd
+        if self.intermediate_size is None:
+            self.intermediate_size = 4 * self.hidden_size
+
+    @property
+    def num_layers(self) -> int:
+        return self.n_layer
+
+    @property
+    def seq_len(self) -> int:
+        return self.sequence_len
 
 
 def norm(x):
@@ -60,6 +93,287 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+
+CosSin = Tuple[torch.Tensor, torch.Tensor]
+
+
+def trunc_normal_init_(x: torch.Tensor, std: float):
+    return nn.init.trunc_normal_(x, std=std).mul_(1.1368472343385565)  # Scale by a constant
+
+
+def rotate_half(x: torch.Tensor):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(x: torch.Tensor, cos_sin: CosSin):
+    # q, k: [..., seq_len, num_heads, head_dim]
+    # cos, sin: [seq_len, head_dim]
+    cos, sin = cos_sin
+    return ((x * cos.unsqueeze(-2)) + (rotate_half(x) * sin.unsqueeze(-2))).to(x.dtype)
+
+
+class CastedLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool, batch_output_dims: Sequence[int] = (),
+                 **kwargs):
+        super().__init__()
+        self.in_features = in_features
+
+        self.weight = nn.Parameter(
+            trunc_normal_init_(torch.empty((*batch_output_dims, out_features, in_features), **kwargs),
+                               std=1.0 / (in_features ** 0.5))
+        )
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros((out_features,), **kwargs))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.linear(input, self.weight.view(-1, self.in_features).to(input.dtype),
+                        self.bias.to(input.dtype) if self.bias is not None else None)
+
+
+class CastedScaledEmbedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, cast_to: torch.dtype):
+        super().__init__()
+        self.cast_to = cast_to
+
+        # Scale to the same std as most parameters
+        self.scale = embedding_dim ** 0.5
+        self.weight = nn.Parameter(
+            trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=1.0 / self.scale)
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input, self.scale * self.weight.to(self.cast_to))
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings, base, device=None):
+        super().__init__()
+
+        # RoPE
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self):
+        return self.cos_cached, self.sin_cached
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, **kwargs):
+        super().__init__()
+        self.gate_up_proj = CastedLinear(hidden_size, intermediate_size, bias=False, batch_output_dims=(2,), **kwargs)
+        self.down_proj = CastedLinear(intermediate_size, hidden_size, bias=False, **kwargs)
+
+    def forward(self, x):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+
+class Attention(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, is_causal, **kwargs):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.is_causal = is_causal
+
+        self.qkv_proj = CastedLinear(hidden_size, self.num_heads * self.head_dim, bias=False, batch_output_dims=(3,),
+                                     **kwargs)
+        self.o_proj = CastedLinear(head_dim * num_heads, hidden_size, bias=False, **kwargs)
+        with torch.no_grad():
+            self.o_proj.weight.zero_()
+
+    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
+        # hidden_states, qkv: [..., seq_len, hidden_size]
+        qkv = self.qkv_proj(hidden_states)
+
+        # Split head (last dimension of projected qkv)
+        qkv = qkv.view(*qkv.shape[:-1], self.num_heads, -1)
+        query, key, value = qkv.chunk(3, dim=-1)
+        # Rotary embedding
+        query = apply_rotary_pos_emb(query, cos_sin)
+        key = apply_rotary_pos_emb(key, cos_sin)
+        # PyTorch SDPA attention
+        attn_output = F.scaled_dot_product_attention(query.transpose(-2, -3), key.transpose(-2, -3),
+                                                     value.transpose(-2, -3), is_causal=self.is_causal).transpose(-2,
+                                                                                                                  -3)
+        # attn_output: [..., seq_len, num_heads, head_dim]
+        attn_output = attn_output.reshape(*attn_output.shape[:-2], -1)
+        return self.o_proj(attn_output)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config: HRMConfig) -> None:
+        super().__init__()
+        hidden_size = config.hidden_size if config.hidden_size is not None else config.n_embd
+        intermediate_size = config.intermediate_size if config.intermediate_size is not None else 4 * hidden_size
+        self.attn = Attention(
+            hidden_size=hidden_size,
+            head_dim=config.head_dim,
+            num_heads=hidden_size // config.head_dim,
+            is_causal=config.is_causal
+        )
+        self.mlp = SwiGLU(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size
+        )
+        self.norm = lambda x: F.rms_norm(x, (x.shape[-1],), eps=config.norm_eps)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
+        x = self.norm(x + self.attn(x, **kwargs))
+        return self.norm(x + self.mlp(x))
+
+
+class HRMRecurrentBlock(nn.Module):
+    def __init__(self, config: HRMConfig) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([TransformerBlock(config) for _layer_idx in range(config.num_layers)])
+
+    def forward(self, x: torch.Tensor, n: torch.Tensor, **kwargs) -> torch.Tensor:
+        h = x + n
+        for layer in self.layers:
+            h = layer(h, **kwargs)
+        return h
+
+
+# HRMCarry is a tuple containing two latent states(z_H, z_L)
+HRMCarry = Tuple[torch.Tensor, torch.Tensor]
+datatype = {
+    'float32': torch.float32,
+    'bfloat16': torch.bfloat16,
+}
+
+
+class HRM(nn.Module):
+    def __init__(self, config: HRMConfig) -> None:
+        super().__init__()
+        self.H_cycles = config.H_cycles
+        self.L_cycles = config.L_cycles
+
+        self.hidden_size = config.hidden_size if config.hidden_size is not None else config.n_embd
+        self.max_seq_len = config.sequence_len
+        self.dtype = datatype[config.forward_dtype]
+
+        self.batch_size = config.batch_size
+
+        # Backbone Layers
+        self.H_level = HRMRecurrentBlock(config)
+        self.L_level = HRMRecurrentBlock(config)
+
+        # RoPE
+        self.rope = RotaryEmbedding(config.head_dim, config.sequence_len, config.rope_base)
+        # I/O Layers
+        self.embed = CastedScaledEmbedding(config.vocab_size, self.hidden_size, cast_to=self.dtype)
+        self.lm_head = CastedLinear(self.hidden_size, config.vocab_size, bias=False)
+
+        # [修复 1]: 移除了 buffer 注册，因为对于独立样本(Shuffle后)不需要跨Batch保存状态。
+        # 我们将在 forward 内部动态生成初始状态。
+
+    # [修复 2]: 这些 carry 管理函数对于独立样本任务不再需要，可以保留空实现或删除
+    def keep_carry(self, ):
+        pass
+
+    def restore_carry(self, ):
+        pass
+
+    def init_carry(self, ):
+        pass
+
+    def init_weights(self):
+        return
+
+    def estimate_flops(self):
+        return 0.0
+
+    def num_scaling_params(self):
+        return {"total": sum(p.numel() for p in self.parameters())}
+
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+    ):
+        del scalar_lr
+        embedding_params = list(self.embed.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        embedding_param_ids = {id(p) for p in embedding_params}
+        lm_head_param_ids = {id(p) for p in lm_head_params}
+        other_params = [
+            p for p in self.parameters()
+            if id(p) not in (embedding_param_ids | lm_head_param_ids)
+        ]
+
+        muon_params = [p for p in other_params if p.ndim == 2]
+        other_adamw_params = [p for p in other_params if p.ndim != 2]
+
+        param_groups = [
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+        ]
+        if other_adamw_params:
+            param_groups.append(
+                dict(kind='adamw', params=other_adamw_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=weight_decay),
+            )
+        for shape in sorted({p.shape for p in muon_params}):
+            group_params = [p for p in muon_params if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+            ))
+        optimizer = MuonAdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, reduction: str = 'mean'):
+        x = self.embed(idx)
+        B, T = idx.shape
+        cos, sin = self.rope()
+        seq_info = dict(cos_sin=(cos[:T], sin[:T]))
+
+        z_H = torch.zeros(B, T, self.hidden_size, device=x.device, dtype=x.dtype)
+        z_L = torch.zeros(B, T, self.hidden_size, device=x.device, dtype=x.dtype)
+
+        with torch.no_grad():
+            for _i in range(self.H_cycles * self.L_cycles - 1):
+                z_L = self.L_level(z_L, z_H + x, **seq_info)
+                if (_i + 1) % self.L_cycles == 0:
+                    z_H = self.H_level(z_H, z_L, **seq_info)
+
+        z_L = self.L_level(z_L, z_H + x, **seq_info)
+        z_H = self.H_level(z_H, z_L, **seq_info)
+
+        logits = self.lm_head(z_H)
+        logits = logits.float()
+        softcap = 15
+        logits = softcap * torch.tanh(logits / softcap)
+
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=reduction,
+            )
+            return loss
+        return logits
 
 
 class CausalSelfAttention(nn.Module):
@@ -198,10 +512,10 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        if self.transformer.wte.weight.device.type == "cuda":
+            self.transformer.wte.to(dtype=torch.bfloat16)
+            for ve in self.value_embeds.values():
+                ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -372,7 +686,6 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             X = a * X + B @ X
     g = X
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -442,21 +755,21 @@ class MuonAdamW(torch.optim.Optimizer):
                             self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
 
     def _step_muon(self, group):
-        params = group['params']
-        if not params:
+        params_with_grad = [p for p in group['params'] if p.grad is not None]
+        if not params_with_grad:
             return
-        p = params[0]
+        p = params_with_grad[0]
         state = self.state[p]
-        num_params = len(params)
+        num_params = len(params_with_grad)
         shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
+        if "momentum_buffer" not in state or state["momentum_buffer"].shape[0] != num_params:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
+        if "second_momentum_buffer" not in state or state["second_momentum_buffer"].shape[0] != num_params:
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
+        stacked_grads = torch.stack([p.grad for p in params_with_grad])
+        stacked_params = torch.stack(params_with_grad)
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
@@ -465,7 +778,7 @@ class MuonAdamW(torch.optim.Optimizer):
                         state["momentum_buffer"], state["second_momentum_buffer"],
                         self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
                         self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        torch._foreach_copy_(params_with_grad, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
     def step(self):
@@ -499,6 +812,14 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 # Model size
 DEPTH = 4               # number of transformer layers
 DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
+MODEL_IMPL = os.environ.get("MODEL_IMPL", "hrm").lower()  # "hrm" | "gpt"
+TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
+MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
+
+if MODEL_IMPL not in {"hrm", "gpt"}:
+    raise ValueError(f"Unsupported MODEL_IMPL={MODEL_IMPL!r}. Expected 'hrm' or 'gpt'.")
+if TRAIN_TIME_BUDGET <= 0:
+    raise ValueError(f"TRAIN_TIME_BUDGET must be > 0, got {TRAIN_TIME_BUDGET}.")
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -533,19 +854,29 @@ def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
+    return HRMConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
+
+def build_model(config: HRMConfig) -> nn.Module:
+    if MODEL_IMPL == "gpt":
+        with torch.device("meta"):
+            model = GPT(config)
+        model.to_empty(device=device)
+        model.init_weights()
+        return model
+
+    model = HRM(config).to(device=device)
+    model.init_weights()
+    return model
+
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
+model = build_model(config)
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -575,7 +906,8 @@ if device_type == "cuda":
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Model impl: {MODEL_IMPL}")
+print(f"Time budget: {TRAIN_TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
@@ -601,8 +933,8 @@ def get_weight_decay(progress):
 # ---------------------------------------------------------------------------
 
 t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
+smooth_train_loss = 0.0
+total_training_time = 0.0
 step = 0
 
 def sync_device(device_type):
@@ -623,7 +955,7 @@ while True:
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    progress = min(total_training_time / TRAIN_TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -639,8 +971,7 @@ while True:
 
     # Fast fail: abort if loss is exploding
     if train_loss_f > 100:
-        print("FAIL")
-        exit(1)
+        raise RuntimeError(f"Loss exploded at step={step}: loss={train_loss_f:.6f}")
 
     sync_device(device_type)
     t1 = time.time()
@@ -656,7 +987,7 @@ while True:
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    remaining = max(0, TRAIN_TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
@@ -670,8 +1001,11 @@ while True:
 
     step += 1
 
+    if MAX_TRAIN_STEPS > 0 and step >= MAX_TRAIN_STEPS:
+        break
+
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > 10 and total_training_time >= TRAIN_TIME_BUDGET:
         break
 
 print()  # newline after \r training log
