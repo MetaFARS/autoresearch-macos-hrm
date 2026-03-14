@@ -856,26 +856,29 @@ def _append_result(val_bpb: float, peak_vram_mb: float):
     p = Path(results_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     desc = _env_str("EXP_DESC", None)
+    cfg_snapshot = dict(
+        depth=DEPTH,
+        aspect_ratio=ASPECT_RATIO,
+        head_dim=HEAD_DIM,
+        device_bs=DEVICE_BATCH_SIZE,
+        total_bs=TOTAL_BATCH_SIZE,
+        h_cycles=H_CYCLES,
+        l_cycles=L_CYCLES,
+        forward_dtype=FORWARD_DTYPE,
+        embedding_lr=EMBEDDING_LR,
+        matrix_lr=MATRIX_LR,
+        unembedding_lr=UNEMBEDDING_LR,
+        weight_decay=WEIGHT_DECAY,
+        warmup_ratio=WARMUP_RATIO,
+        warmdown_ratio=WARMDOWN_RATIO,
+        final_lr_frac=FINAL_LR_FRAC,
+        logits_softcap=float(os.environ.get("LOGITS_SOFTCAP", "15") or "15"),
+        zero_o_proj_init=int(os.environ.get("ZERO_O_PROJ_INIT", "1") or "1"),
+        seed=seed,
+    )
     if desc is None:
         desc = json.dumps(
-            dict(
-                depth=DEPTH,
-                aspect_ratio=ASPECT_RATIO,
-                head_dim=HEAD_DIM,
-                device_bs=DEVICE_BATCH_SIZE,
-                total_bs=TOTAL_BATCH_SIZE,
-                h_cycles=H_CYCLES,
-                l_cycles=L_CYCLES,
-                forward_dtype=FORWARD_DTYPE,
-                embedding_lr=EMBEDDING_LR,
-                matrix_lr=MATRIX_LR,
-                unembedding_lr=UNEMBEDDING_LR,
-                weight_decay=WEIGHT_DECAY,
-                warmup_ratio=WARMUP_RATIO,
-                warmdown_ratio=WARMDOWN_RATIO,
-                final_lr_frac=FINAL_LR_FRAC,
-                seed=seed,
-            ),
+            cfg_snapshot,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -895,7 +898,7 @@ def _append_result(val_bpb: float, peak_vram_mb: float):
         best_path = p.with_name("best.json")
         new_best = best is None or val_bpb < best
         if new_best:
-            best_payload = dict(commit=commit, val_bpb=val_bpb, memory_gb=memory_gb, description=desc)
+            best_payload = dict(commit=commit, val_bpb=val_bpb, memory_gb=memory_gb, description=desc, config=cfg_snapshot)
             best_path.write_text(json.dumps(best_payload, ensure_ascii=False), encoding="utf-8")
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
