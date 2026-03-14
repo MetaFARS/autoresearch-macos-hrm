@@ -195,8 +195,9 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(hidden_size, self.num_heads * self.head_dim, bias=False, batch_output_dims=(3,),
                                      **kwargs)
         self.o_proj = CastedLinear(head_dim * num_heads, hidden_size, bias=False, **kwargs)
-        with torch.no_grad():
-            self.o_proj.weight.zero_()
+        if os.environ.get("ZERO_O_PROJ_INIT", "1").strip() != "0":
+            with torch.no_grad():
+                self.o_proj.weight.zero_()
 
     def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
         # hidden_states, qkv: [..., seq_len, hidden_size]
@@ -361,8 +362,9 @@ class HRM(nn.Module):
 
         logits = self.lm_head(z_H)
         logits = logits.float()
-        softcap = 15
-        logits = softcap * torch.tanh(logits / softcap)
+        softcap = float(os.environ.get("LOGITS_SOFTCAP", "15") or "15")
+        if softcap > 0:
+            logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
             loss = F.cross_entropy(
