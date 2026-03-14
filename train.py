@@ -223,6 +223,9 @@ class TransformerBlock(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size if config.hidden_size is not None else config.n_embd
         intermediate_size = config.intermediate_size if config.intermediate_size is not None else 4 * hidden_size
+        self.hidden_size = hidden_size
+        self.prenorm = (os.environ.get("PRENORM", "0") or "0").strip() == "1"
+        self.layer_scale_init = float(os.environ.get("LAYER_SCALE_INIT", "0") or "0")
         self.attn = Attention(
             hidden_size=hidden_size,
             head_dim=config.head_dim,
@@ -234,10 +237,30 @@ class TransformerBlock(nn.Module):
             intermediate_size=intermediate_size
         )
         self.norm = lambda x: F.rms_norm(x, (x.shape[-1],), eps=config.norm_eps)
+        if self.layer_scale_init > 0:
+            self.ls_attn = nn.Parameter(torch.full((self.hidden_size,), self.layer_scale_init))
+            self.ls_mlp = nn.Parameter(torch.full((self.hidden_size,), self.layer_scale_init))
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
-        x = self.norm(x + self.attn(x, **kwargs))
-        return self.norm(x + self.mlp(x))
+        if self.prenorm:
+            h = self.norm(x)
+            attn_out = self.attn(h, **kwargs)
+            if self.layer_scale_init > 0:
+                attn_out = attn_out * self.ls_attn
+            x = x + attn_out
+            h = self.norm(x)
+            mlp_out = self.mlp(h)
+            if self.layer_scale_init > 0:
+                mlp_out = mlp_out * self.ls_mlp
+            return x + mlp_out
+        attn_out = self.attn(x, **kwargs)
+        if self.layer_scale_init > 0:
+            attn_out = attn_out * self.ls_attn
+        x = self.norm(x + attn_out)
+        mlp_out = self.mlp(x)
+        if self.layer_scale_init > 0:
+            mlp_out = mlp_out * self.ls_mlp
+        return self.norm(x + mlp_out)
 
 
 class HRMRecurrentBlock(nn.Module):
@@ -860,6 +883,8 @@ def _elite_distance(a: dict, b: dict) -> float:
         ("l_cycles", 1.0),
         ("logits_softcap", 0.1),
         ("zero_o_proj_init", 1.0),
+        ("prenorm", 1.0),
+        ("layer_scale_init", 5.0),
     ]
     d = 0.0
     for k, w in keys:
@@ -904,6 +929,8 @@ def _append_result(val_bpb: float, peak_vram_mb: float):
         final_lr_frac=FINAL_LR_FRAC,
         logits_softcap=float(os.environ.get("LOGITS_SOFTCAP", "15") or "15"),
         zero_o_proj_init=int(os.environ.get("ZERO_O_PROJ_INIT", "1") or "1"),
+        prenorm=int(os.environ.get("PRENORM", "0") or "0"),
+        layer_scale_init=float(os.environ.get("LAYER_SCALE_INIT", "0") or "0"),
         seed=seed,
     )
     if desc is None:
