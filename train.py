@@ -849,6 +849,36 @@ def _parse_best_val_bpb(lines: list[str]) -> float | None:
     return best
 
 
+def _elite_distance(a: dict, b: dict) -> float:
+    if not a or not b:
+        return 0.0
+    keys = [
+        ("depth", 2.0),
+        ("head_dim", 1.0),
+        ("aspect_ratio", 0.1),
+        ("h_cycles", 1.0),
+        ("l_cycles", 1.0),
+        ("logits_softcap", 0.1),
+        ("zero_o_proj_init", 1.0),
+    ]
+    d = 0.0
+    for k, w in keys:
+        if k not in a or k not in b:
+            continue
+        va = a[k]
+        vb = b[k]
+        if isinstance(va, str) or isinstance(vb, str):
+            d += w * (0.0 if va == vb else 1.0)
+        else:
+            try:
+                d += w * abs(float(va) - float(vb))
+            except Exception:
+                pass
+    if a.get("forward_dtype") != b.get("forward_dtype"):
+        d += 1.0
+    return d
+
+
 def _append_result(val_bpb: float, peak_vram_mb: float):
     results_path = _env_str("RESULTS_PATH", None)
     if results_path is None:
@@ -900,6 +930,43 @@ def _append_result(val_bpb: float, peak_vram_mb: float):
         if new_best:
             best_payload = dict(commit=commit, val_bpb=val_bpb, memory_gb=memory_gb, description=desc, config=cfg_snapshot)
             best_path.write_text(json.dumps(best_payload, ensure_ascii=False), encoding="utf-8")
+
+        elite_path = p.with_name("elite.json")
+        elite = {}
+        if elite_path.exists():
+            try:
+                elite = json.loads(elite_path.read_text(encoding="utf-8"))
+            except Exception:
+                elite = {}
+        best_rec = elite.get("best")
+        second_rec = elite.get("second")
+        promising_rec = elite.get("promising")
+        cur = dict(commit=commit, val_bpb=val_bpb, memory_gb=memory_gb, description=desc, config=cfg_snapshot)
+
+        def better(x, y):
+            if x is None:
+                return True
+            return float(y) < float(x)
+
+        if best_rec is None or better(best_rec.get("val_bpb"), val_bpb):
+            second_rec = best_rec
+            best_rec = cur
+        elif second_rec is None or better(second_rec.get("val_bpb"), val_bpb):
+            second_rec = cur
+
+        margin = float(os.environ.get("PROMISING_MARGIN", "0.05") or "0.05")
+        base_cfg = (best_rec or {}).get("config") or {}
+        cur_dist = _elite_distance(cfg_snapshot, base_cfg)
+        cur_ok = best_rec is None or val_bpb <= float(best_rec.get("val_bpb")) + margin
+        if cur_ok:
+            best_dist = _elite_distance((best_rec or {}).get("config") or {}, base_cfg)
+            second_dist = _elite_distance((second_rec or {}).get("config") or {}, base_cfg)
+            prom_dist = _elite_distance((promising_rec or {}).get("config") or {}, base_cfg) if promising_rec else -1.0
+            if cur_dist > prom_dist and cur_dist > best_dist and cur_dist > second_dist:
+                promising_rec = cur
+
+        elite_out = dict(best=best_rec, second=second_rec, promising=promising_rec)
+        elite_path.write_text(json.dumps(elite_out, ensure_ascii=False), encoding="utf-8")
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
