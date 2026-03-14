@@ -14,6 +14,11 @@ from dataclasses import dataclass, asdict
 from typing import Sequence, Tuple
 
 import sys
+import json
+import subprocess
+from pathlib import Path
+
+import fcntl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -534,25 +539,69 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+def _env_str(name: str, default: str | None = None) -> str | None:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip()
+    return v if v else default
+
+
+def _env_int(name: str, default: int) -> int:
+    v = _env_str(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    v = _env_str(name)
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+
+def _env_betas(name: str, default: tuple[float, float]) -> tuple[float, float]:
+    v = _env_str(name)
+    if v is None:
+        return default
+    parts = [p.strip() for p in v.split(",") if p.strip()]
+    if len(parts) != 2:
+        return default
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        return default
+
+
 # Model architecture
-ASPECT_RATIO = 51       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 8            # target head dimension for attention
+ASPECT_RATIO = _env_int("ASPECT_RATIO", 51)       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = _env_int("HEAD_DIM", 8)               # target head dimension for attention
+H_CYCLES = _env_int("H_CYCLES", 2)
+L_CYCLES = _env_int("L_CYCLES", 2)
+FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "float32") or "float32"
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+TOTAL_BATCH_SIZE = _env_int("TOTAL_BATCH_SIZE", 2**16)  # tokens per optimizer step (effective)
+EMBEDDING_LR = _env_float("EMBEDDING_LR", 0.6)          # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = _env_float("UNEMBEDDING_LR", 0.004)    # learning rate for lm_head (Adam)
+MATRIX_LR = _env_float("MATRIX_LR", 0.04)               # learning rate for matrix parameters (Muon)
+SCALAR_LR = _env_float("SCALAR_LR", 0.5)                # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = _env_float("WEIGHT_DECAY", 0.2)          # cautious weight decay for Muon
+ADAM_BETAS = _env_betas("ADAM_BETAS", (0.8, 0.95))      # Adam beta1, beta2
+WARMUP_RATIO = _env_float("WARMUP_RATIO", 0.0)          # fraction of time budget for LR warmup
+WARMDOWN_RATIO = _env_float("WARMDOWN_RATIO", 0.5)      # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = _env_float("FINAL_LR_FRAC", 0.0)        # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 2   # per-device batch size (reduce if OOM)
+DEPTH = _env_int("DEPTH", 8)                    # number of transformer layers
+DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 2)  # per-device batch size (reduce if OOM)
 TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
 MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
 
@@ -564,9 +613,10 @@ if TRAIN_TIME_BUDGET <= 0:
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
+seed = _env_int("SEED", 42)
+torch.manual_seed(seed)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(seed)
 torch.set_float32_matmul_precision("high")
 
 # Detect device
@@ -596,6 +646,9 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         head_dim=HEAD_DIM,
+        H_cycles=H_CYCLES,
+        L_cycles=L_CYCLES,
+        forward_dtype=FORWARD_DTYPE,
     )
 
 
@@ -618,8 +671,8 @@ num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+grad_accum_steps = max(1, (TOTAL_BATCH_SIZE + tokens_per_fwdbwd - 1) // tokens_per_fwdbwd)
+TOTAL_BATCH_SIZE = grad_accum_steps * tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -767,3 +820,82 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+
+def _git_short_hash() -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
+        return out.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+def _parse_best_val_bpb(lines: list[str]) -> float | None:
+    best = None
+    for line in lines[1:]:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            v = float(parts[1])
+        except ValueError:
+            continue
+        if v <= 0:
+            continue
+        if best is None or v < best:
+            best = v
+    return best
+
+
+def _append_result(val_bpb: float, peak_vram_mb: float):
+    results_path = _env_str("RESULTS_PATH", None)
+    if results_path is None:
+        return
+    p = Path(results_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    desc = _env_str("EXP_DESC", None)
+    if desc is None:
+        desc = json.dumps(
+            dict(
+                depth=DEPTH,
+                aspect_ratio=ASPECT_RATIO,
+                head_dim=HEAD_DIM,
+                device_bs=DEVICE_BATCH_SIZE,
+                total_bs=TOTAL_BATCH_SIZE,
+                h_cycles=H_CYCLES,
+                l_cycles=L_CYCLES,
+                forward_dtype=FORWARD_DTYPE,
+                embedding_lr=EMBEDDING_LR,
+                matrix_lr=MATRIX_LR,
+                unembedding_lr=UNEMBEDDING_LR,
+                weight_decay=WEIGHT_DECAY,
+                warmup_ratio=WARMUP_RATIO,
+                warmdown_ratio=WARMDOWN_RATIO,
+                final_lr_frac=FINAL_LR_FRAC,
+                seed=seed,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    memory_gb = peak_vram_mb / 1024.0
+    commit = _git_short_hash()
+    line_tpl = f"{commit}\t{val_bpb:.6f}\t{memory_gb:.1f}\t"
+    lock_path = p.with_suffix(p.suffix + ".lock")
+    with open(lock_path, "a+") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        if not p.exists():
+            p.write_text("commit\tval_bpb\tmemory_gb\tstatus\tdescription\n", encoding="utf-8")
+        existing = p.read_text(encoding="utf-8").splitlines(keepends=True)
+        best = _parse_best_val_bpb(existing)
+        status = "keep" if best is None or val_bpb < best else "discard"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{line_tpl}{status}\t{desc}\n")
+        best_path = p.with_name("best.json")
+        new_best = best is None or val_bpb < best
+        if new_best:
+            best_payload = dict(commit=commit, val_bpb=val_bpb, memory_gb=memory_gb, description=desc)
+            best_path.write_text(json.dumps(best_payload, ensure_ascii=False), encoding="utf-8")
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+_append_result(val_bpb=val_bpb, peak_vram_mb=peak_vram_mb)
