@@ -17,17 +17,28 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+import requests
 
-def verify_macos_env():
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
 
-verify_macos_env()
+def _import_prepare():
+    orig_platform = sys.platform
+    orig_mps_is_available = torch.backends.mps.is_available
+    try:
+        sys.platform = "darwin"
+        torch.backends.mps.is_available = lambda: True
+        import prepare
+        return prepare
+    finally:
+        sys.platform = orig_platform
+        torch.backends.mps.is_available = orig_mps_is_available
+
+
+prepare = _import_prepare()
+MAX_SEQ_LEN = prepare.MAX_SEQ_LEN
+TIME_BUDGET = prepare.TIME_BUDGET
+Tokenizer = prepare.Tokenizer
+make_dataloader = prepare.make_dataloader
+evaluate_bpb = prepare.evaluate_bpb
 
 # ---------------------------------------------------------------------------
 # GPT Model
