@@ -75,7 +75,7 @@ class HRMConfig:
 
     norm_eps: float = 1e-6
     rope_base: float = 10000.0
-    forward_dtype: str = "float32"  # change to float32 if your hardware doesn't support bfloat16
+    forward_dtype: str = "bfloat16"  # change to float32 if your hardware doesn't support bfloat16
 
     seed: int = 7
 
@@ -618,7 +618,7 @@ FINAL_LR_FRAC = _env_float("FINAL_LR_FRAC", 0.0)        # final LR as fraction o
 
 # Model size
 DEPTH = _env_int("DEPTH", 4)                    # number of transformer layers
-DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 2)  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 4)  # per-device batch size (reduce if OOM)
 TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
 MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
 
@@ -990,4 +990,3 @@ def _append_result(val_bpb: float, peak_vram_mb: float):
 
 
 _append_result(val_bpb=val_bpb, peak_vram_mb=peak_vram_mb)
-
