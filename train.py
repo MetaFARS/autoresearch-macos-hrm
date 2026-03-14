@@ -607,11 +607,11 @@ def _env_betas(name: str, default: tuple[float, float]) -> tuple[float, float]:
 
 
 # Model architecture
-ASPECT_RATIO = _env_int("ASPECT_RATIO", 48)       # model_dim = depth * ASPECT_RATIO
+ASPECT_RATIO = _env_int("ASPECT_RATIO", 64)       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = _env_int("HEAD_DIM", 32)               # target head dimension for attention
 H_CYCLES = _env_int("H_CYCLES", 2)
 L_CYCLES = _env_int("L_CYCLES", 2)
-FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "float32") or "float32"
+FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "bfloat16") or "bfloat16"
 
 # Optimization
 TOTAL_BATCH_SIZE = _env_int("TOTAL_BATCH_SIZE", 2**16)  # tokens per optimizer step (effective)
