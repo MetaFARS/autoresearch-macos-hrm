@@ -372,17 +372,8 @@ class HRM(nn.Module):
         cos, sin = self.rope()
         seq_info = dict(cos_sin=(cos[:T], sin[:T]))
 
-        z_H = torch.zeros(B, T, self.hidden_size, device=x.device, dtype=x.dtype)
-        z_L = torch.zeros(B, T, self.hidden_size, device=x.device, dtype=x.dtype)
-
-        with torch.no_grad():
-            for _i in range(self.H_cycles * self.L_cycles - 1):
-                z_L = self.L_level(z_L, z_H + x, **seq_info)
-                if (_i + 1) % self.L_cycles == 0:
-                    z_H = self.H_level(z_H, z_L, **seq_info)
-
-        z_L = self.L_level(z_L, z_H + x, **seq_info)
-        z_H = self.H_level(z_H, z_L, **seq_info)
+        z_L = self.L_level(torch.zeros_like(x), x, **seq_info)
+        z_H = self.H_level(torch.zeros_like(x), z_L, **seq_info)
 
         logits = self.lm_head(z_H)
         logits = logits.float()
@@ -609,8 +600,8 @@ def _env_betas(name: str, default: tuple[float, float]) -> tuple[float, float]:
 # Model architecture
 ASPECT_RATIO = _env_int("ASPECT_RATIO", 64)       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = _env_int("HEAD_DIM", 32)               # target head dimension for attention
-H_CYCLES = _env_int("H_CYCLES", 2)
-L_CYCLES = _env_int("L_CYCLES", 2)
+H_CYCLES = _env_int("H_CYCLES", 1)
+L_CYCLES = _env_int("L_CYCLES", 1)
 FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "bfloat16") or "bfloat16"
 
 # Optimization
@@ -999,3 +990,4 @@ def _append_result(val_bpb: float, peak_vram_mb: float):
 
 
 _append_result(val_bpb=val_bpb, peak_vram_mb=peak_vram_mb)
+
