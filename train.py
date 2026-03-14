@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
@@ -606,8 +607,8 @@ def _env_betas(name: str, default: tuple[float, float]) -> tuple[float, float]:
 
 
 # Model architecture
-ASPECT_RATIO = _env_int("ASPECT_RATIO", 51)       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = _env_int("HEAD_DIM", 8)               # target head dimension for attention
+ASPECT_RATIO = _env_int("ASPECT_RATIO", 48)       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = _env_int("HEAD_DIM", 32)               # target head dimension for attention
 H_CYCLES = _env_int("H_CYCLES", 2)
 L_CYCLES = _env_int("L_CYCLES", 2)
 FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "float32") or "float32"
@@ -625,7 +626,7 @@ WARMDOWN_RATIO = _env_float("WARMDOWN_RATIO", 0.5)      # fraction of time budge
 FINAL_LR_FRAC = _env_float("FINAL_LR_FRAC", 0.0)        # final LR as fraction of initial
 
 # Model size
-DEPTH = _env_int("DEPTH", 8)                    # number of transformer layers
+DEPTH = _env_int("DEPTH", 4)                    # number of transformer layers
 DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 2)  # per-device batch size (reduce if OOM)
 TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
 MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
