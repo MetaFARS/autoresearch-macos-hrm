@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
@@ -75,7 +74,7 @@ class HRMConfig:
 
     norm_eps: float = 1e-6
     rope_base: float = 10000.0
-    forward_dtype: str = "bfloat16"  # change to float32 if your hardware doesn't support bfloat16
+    forward_dtype: str = "float32"  # change to float32 if your hardware doesn't support bfloat16
 
     seed: int = 7
 
@@ -372,8 +371,17 @@ class HRM(nn.Module):
         cos, sin = self.rope()
         seq_info = dict(cos_sin=(cos[:T], sin[:T]))
 
-        z_L = self.L_level(torch.zeros_like(x), x, **seq_info)
-        z_H = self.H_level(torch.zeros_like(x), z_L, **seq_info)
+        z_H = torch.zeros(B, T, self.hidden_size, device=x.device, dtype=x.dtype)
+        z_L = torch.zeros(B, T, self.hidden_size, device=x.device, dtype=x.dtype)
+
+        with torch.no_grad():
+            for _i in range(self.H_cycles * self.L_cycles - 1):
+                z_L = self.L_level(z_L, z_H + x, **seq_info)
+                if (_i + 1) % self.L_cycles == 0:
+                    z_H = self.H_level(z_H, z_L, **seq_info)
+
+        z_L = self.L_level(z_L, z_H + x, **seq_info)
+        z_H = self.H_level(z_H, z_L, **seq_info)
 
         logits = self.lm_head(z_H)
         logits = logits.float()
@@ -598,11 +606,11 @@ def _env_betas(name: str, default: tuple[float, float]) -> tuple[float, float]:
 
 
 # Model architecture
-ASPECT_RATIO = _env_int("ASPECT_RATIO", 64)       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = _env_int("HEAD_DIM", 32)               # target head dimension for attention
-H_CYCLES = _env_int("H_CYCLES", 1)
-L_CYCLES = _env_int("L_CYCLES", 1)
-FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "bfloat16") or "bfloat16"
+ASPECT_RATIO = _env_int("ASPECT_RATIO", 51)       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = _env_int("HEAD_DIM", 8)               # target head dimension for attention
+H_CYCLES = _env_int("H_CYCLES", 2)
+L_CYCLES = _env_int("L_CYCLES", 2)
+FORWARD_DTYPE = _env_str("FORWARD_DTYPE", "float32") or "float32"
 
 # Optimization
 TOTAL_BATCH_SIZE = _env_int("TOTAL_BATCH_SIZE", 2**16)  # tokens per optimizer step (effective)
@@ -617,8 +625,8 @@ WARMDOWN_RATIO = _env_float("WARMDOWN_RATIO", 0.5)      # fraction of time budge
 FINAL_LR_FRAC = _env_float("FINAL_LR_FRAC", 0.0)        # final LR as fraction of initial
 
 # Model size
-DEPTH = _env_int("DEPTH", 4)                    # number of transformer layers
-DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 4)  # per-device batch size (reduce if OOM)
+DEPTH = _env_int("DEPTH", 8)                    # number of transformer layers
+DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 2)  # per-device batch size (reduce if OOM)
 TRAIN_TIME_BUDGET = float(os.environ.get("TRAIN_TIME_BUDGET", TIME_BUDGET))
 MAX_TRAIN_STEPS = int(os.environ.get("MAX_TRAIN_STEPS", "0"))  # 0 means disabled
 

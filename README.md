@@ -49,6 +49,10 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
+## External controller
+
+If you want the control plane (LLM calls, patching, scheduling, rollback) to live outside this repo, see [EXTERNAL_CONTROLLER.md](file:///root/autoresearch-macos-hrm/EXTERNAL_CONTROLLER.md).
+
 ## Project structure
 
 ```
